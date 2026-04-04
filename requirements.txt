@@ -1,0 +1,7 @@
+torch>=2.2
+prettyPlot>=0.0.31
+pandas
+corner
+numpyro
+black>=24.3.0
+scikit-learn>=1.5.0
