@@ -38,9 +38,9 @@ def makeParams():
             self.T_ref = np.float64(303.15)
             self.C = np.float64(-2.0)
             self.tmin = np.float64(0)
-            self.tmax = np.float64(3722179.0)#时间上限
+            self.tmax = np.float64(1350)
             self.rmin = np.float64(0)
-            self.I = np.float64(0.00033)#电流起点
+            self.I = np.float64(1.89e-2 * self.C)
 
     class Anode:
         def __init__(self):
@@ -90,13 +90,13 @@ def makeParams():
         class Anode_IC:
             def __init__(self):
                 self.ce = np.float64(1.2)
-                self.cs = np.float64(0.00100000253293656 * an.csmax)#负极初始浓度
+                self.cs = np.float64(0.91 * an.csmax)
                 self.phis = np.float64(0.0)
 
         class Cathode_IC:
             def __init__(self, cs_a0):
                 self.ce = np.float64(1.2)
-                self.cs = np.float64(0.4634028432597517 * ca.csmax)
+                self.cs = np.float64(0.39 * ca.csmax)
                 self.phis = ca.uocp(self.cs, ca.csmax) - an.uocp(cs_a0, an.csmax)
 
     ic = IC()
