@@ -1,0 +1,47 @@
+{
+  "repo_root": "C:\\Users\\Tiga_QJW\\Desktop\\myPINN-V1\\myPINN-ASSB-V1",
+  "model_dir": "C:\\Users\\Tiga_QJW\\Desktop\\myPINN-V1\\myPINN-ASSB-V1\\pinn_spm_param\\ModelFin_9101",
+  "data_dir": "C:\\Users\\Tiga_QJW\\Desktop\\ZHB_realDATA\\softlabels_nr64",
+  "checkpoint": "C:\\Users\\Tiga_QJW\\Desktop\\myPINN-V1\\myPINN-ASSB-V1\\pinn_spm_param\\ModelFin_9101\\best.pt",
+  "norm_mode": "range",
+  "device": "cuda",
+  "config_file": "C:\\Users\\Tiga_QJW\\Desktop\\myPINN-V1\\myPINN-ASSB-V1\\pinn_spm_param\\ModelFin_9101\\config.json",
+  "metrics": {
+    "phie": {
+      "n_samples": 1874,
+      "denom": 0.30294267080844617,
+      "mae": 0.06699460562619294,
+      "rmse": 0.07741226051042945,
+      "nmae": 0.22114615101071164,
+      "nrmse": 0.25553435672777186,
+      "r2": 0.0003067526392096509
+    },
+    "phis_c": {
+      "n_samples": 1874,
+      "denom": 0.3223962663120927,
+      "mae": 0.0711985028754731,
+      "rmse": 0.08226889408822739,
+      "nmae": 0.22084158631834166,
+      "nrmse": 0.25517942570894336,
+      "r2": 0.00036367703323614275
+    },
+    "cs_a": {
+      "n_samples": 11994,
+      "denom": 0.49718119847295156,
+      "mae": 0.2569216311044399,
+      "rmse": 0.27878331956909014,
+      "nmae": 0.5167565304029037,
+      "nrmse": 0.5607277998953876,
+      "r2": -5.636278065118268
+    },
+    "cs_c": {
+      "n_samples": 11994,
+      "denom": 0.5931248739632444,
+      "mae": 0.3227560667985951,
+      "rmse": 0.34777318113713823,
+      "nmae": 0.5441620828375444,
+      "nrmse": 0.5863405775133442,
+      "r2": -6.24858141135309
+    }
+  }
+}

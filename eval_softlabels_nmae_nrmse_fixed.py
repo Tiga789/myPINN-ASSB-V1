@@ -4,20 +4,21 @@ import json
 import math
 import os
 import sys
-from typing import Dict, List, Tuple
+from typing import Dict, List
 
 import numpy as np
 import torch
 
 
 def parse_args() -> argparse.Namespace:
-    p = argparse.ArgumentParser(description="Evaluate trained PINN on soft-label test splits with NMAE/NRMSE.")
-    p.add_argument("--repo-root", required=True, help="Path to repo root, e.g. C:/.../myPINN-ASSB-V1")
-    p.add_argument("--model-dir", required=True, help="Path to ModelFin_9101 or renamed model folder")
-    p.add_argument("--data-dir", required=True, help="Folder containing data_phie.npz/data_phis_c.npz/data_cs_a.npz/data_cs_c.npz")
-    p.add_argument("--weight-name", default=None, help="Checkpoint filename inside model dir. Default: auto-pick best.pt, best.weights.h5, last.pt, last.weights.h5")
-    p.add_argument("--norm", default="range", choices=["range", "mean_abs", "std"], help="Normalization denominator for NMAE/NRMSE")
-    p.add_argument("--output-prefix", default="eval_softlabels_9101", help="Prefix for output csv/json files")
+    p = argparse.ArgumentParser(description="Evaluate trained PINN on soft-label test splits with physical rescaling applied.")
+    p.add_argument("--repo-root", required=True)
+    p.add_argument("--model-dir", required=True)
+    p.add_argument("--data-dir", required=True)
+    p.add_argument("--weight-name", default=None)
+    p.add_argument("--norm", default="range", choices=["range", "mean_abs", "std"])
+    p.add_argument("--output-prefix", default="eval_softlabels_fixed")
+    p.add_argument("--batch-size", type=int, default=65536)
     return p.parse_args()
 
 
@@ -65,42 +66,11 @@ def build_model(repo_root: str, model_dir: str, ckpt_path: str):
     return nn, config
 
 
-def prepare_inputs(x: np.ndarray, x_params: np.ndarray) -> List[torch.Tensor]:
+def to_2d_np(x: np.ndarray) -> np.ndarray:
     x = np.asarray(x, dtype=np.float64)
-    x_params = np.asarray(x_params, dtype=np.float64)
     if x.ndim == 1:
         x = x.reshape(-1, 1)
-    if x_params.ndim == 1:
-        x_params = x_params.reshape(-1, 2)
-
-    if x.shape[1] == 1:
-        t = x[:, 0:1]
-        r = np.zeros_like(t)
-    elif x.shape[1] >= 2:
-        t = x[:, 0:1]
-        r = x[:, 1:2]
-    else:
-        raise ValueError(f"Unexpected x shape: {x.shape}")
-
-    deg_i0_a = x_params[:, 0:1]
-    deg_ds_c = x_params[:, 1:2]
-
-    return [
-        torch.as_tensor(t, dtype=torch.float64),
-        torch.as_tensor(r, dtype=torch.float64),
-        torch.as_tensor(deg_i0_a, dtype=torch.float64),
-        torch.as_tensor(deg_ds_c, dtype=torch.float64),
-    ]
-
-
-@torch.no_grad()
-def predict_target(nn, target: str, x: np.ndarray, x_params: np.ndarray) -> np.ndarray:
-    inputs = prepare_inputs(x, x_params)
-    # move to same device as model
-    inputs = [tensor.to(nn.device) for tensor in inputs]
-    outputs = nn.model(inputs, training=False)
-    pred = outputs[TARGET_INDEX[target]].detach().cpu().numpy().reshape(-1, 1)
-    return pred
+    return x
 
 
 def r2_score(y_true: np.ndarray, y_pred: np.ndarray) -> float:
@@ -144,6 +114,62 @@ def compute_metrics(y_true: np.ndarray, y_pred: np.ndarray, mode: str) -> Dict[s
     }
 
 
+@torch.no_grad()
+def predict_target(nn, target: str, x: np.ndarray, x_params: np.ndarray, batch_size: int) -> np.ndarray:
+    x = to_2d_np(x)
+    x_params = to_2d_np(x_params)
+    if x_params.shape[1] != 2:
+        raise ValueError(f"x_params must have 2 columns, got {x_params.shape}")
+
+    resc_t = float(nn.params["rescale_T"])
+    resc_r = float(nn.params["rescale_R"])
+
+    preds = []
+    for start in range(0, len(x), batch_size):
+        end = min(start + batch_size, len(x))
+        xb = x[start:end]
+        pb = x_params[start:end]
+
+        t = torch.as_tensor(xb[:, 0:1], dtype=torch.float64, device=nn.device)
+        if xb.shape[1] >= 2:
+            r = torch.as_tensor(xb[:, 1:2], dtype=torch.float64, device=nn.device)
+        else:
+            r = torch.zeros_like(t)
+        deg_i0_a = torch.as_tensor(pb[:, 0:1], dtype=torch.float64, device=nn.device)
+        deg_ds_c = torch.as_tensor(pb[:, 1:2], dtype=torch.float64, device=nn.device)
+
+        deg_i0_a_scaled = nn.rescale_param(deg_i0_a, nn.ind_deg_i0_a)
+        deg_ds_c_scaled = nn.rescale_param(deg_ds_c, nn.ind_deg_ds_c)
+
+        if target in ("phie", "phis_c"):
+            r_use = float(nn.params["Rs_a"]) * torch.ones_like(t)
+        else:
+            r_use = r
+
+        outputs = nn.model([
+            t / resc_t,
+            r_use / resc_r,
+            deg_i0_a_scaled,
+            deg_ds_c_scaled,
+        ], training=False)
+        raw = outputs[TARGET_INDEX[target]]
+
+        if target == "phie":
+            pred = nn.rescalePhie(raw, t, deg_i0_a, deg_ds_c)
+        elif target == "phis_c":
+            pred = nn.rescalePhis_c(raw, t, deg_i0_a, deg_ds_c)
+        elif target == "cs_a":
+            pred = nn.rescaleCs_a(raw, t, r, deg_i0_a, deg_ds_c, clip=False)
+        elif target == "cs_c":
+            pred = nn.rescaleCs_c(raw, t, r, deg_i0_a, deg_ds_c, clip=False)
+        else:
+            raise ValueError(target)
+
+        preds.append(pred.detach().cpu().numpy().reshape(-1, 1))
+
+    return np.vstack(preds)
+
+
 def main() -> None:
     args = parse_args()
     model_dir = os.path.abspath(args.model_dir)
@@ -164,7 +190,6 @@ def main() -> None:
     }
 
     rows: List[Dict[str, object]] = []
-
     for target, fname in TARGET_FILES.items():
         path = os.path.join(data_dir, fname)
         if not os.path.isfile(path):
@@ -173,7 +198,7 @@ def main() -> None:
         x_test = z["x_test"]
         y_test = z["y_test"]
         x_params_test = z["x_params_test"]
-        y_pred = predict_target(nn, target, x_test, x_params_test)
+        y_pred = predict_target(nn, target, x_test, x_params_test, args.batch_size)
         metrics = compute_metrics(y_test, y_pred, args.norm)
         summary["metrics"][target] = metrics
         rows.append({"target": target, **metrics})
@@ -182,10 +207,7 @@ def main() -> None:
     json_path = os.path.join(model_dir, f"{args.output_prefix}_metrics.json")
 
     with open(csv_path, "w", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(
-            f,
-            fieldnames=["target", "n_samples", "denom", "mae", "rmse", "nmae", "nrmse", "r2"],
-        )
+        writer = csv.DictWriter(f, fieldnames=["target", "n_samples", "denom", "mae", "rmse", "nmae", "nrmse", "r2"])
         writer.writeheader()
         writer.writerows(rows)
 
