@@ -19,7 +19,6 @@ def _normalize_col_name_ASSBfinal1(name: object) -> str:
     return text
 
 
-
 def _first_existing_ASSBfinal1(df: pd.DataFrame, candidates: Iterable[str]) -> str:
     normalized = {_normalize_col_name_ASSBfinal1(col): col for col in df.columns}
     for candidate in candidates:
@@ -29,14 +28,12 @@ def _first_existing_ASSBfinal1(df: pd.DataFrame, candidates: Iterable[str]) -> s
     raise KeyError(f"Missing required column. Tried: {list(candidates)}")
 
 
-
 def detect_columns_ASSBfinal1(df: pd.DataFrame) -> dict[str, str]:
     return {
         "cycle": _first_existing_ASSBfinal1(df, ["循环号", "循环", "cycle", "循环序号"]),
         "total_time": _first_existing_ASSBfinal1(df, ["总时间", "累计时间", "累积时间", "totaltime"]),
         "current": _first_existing_ASSBfinal1(df, ["电流(A)", "电流", "current(a)", "current"]),
     }
-
 
 
 def series_to_seconds_ASSBfinal1(series: pd.Series) -> np.ndarray:
@@ -65,7 +62,6 @@ def series_to_seconds_ASSBfinal1(series: pd.Series) -> np.ndarray:
     raise ValueError("Unable to convert the selected time column to seconds.")
 
 
-
 def resolve_csv_from_input_ASSBfinal1(input_path: Path) -> tuple[Path, tempfile.TemporaryDirectory | None]:
     if not input_path.exists():
         raise FileNotFoundError(f"Input file not found: {input_path}")
@@ -83,7 +79,6 @@ def resolve_csv_from_input_ASSBfinal1(input_path: Path) -> tuple[Path, tempfile.
         return Path(tmpdir.name) / csv_members[0], tmpdir
 
 
-
 def read_csv_auto_ASSBfinal1(csv_path: Path, encoding: str = "auto") -> tuple[pd.DataFrame, str]:
     attempted: list[str] = []
     candidates = ENCODING_CANDIDATES_ASSBfinal1 if encoding == "auto" else [encoding]
@@ -95,7 +90,6 @@ def read_csv_auto_ASSBfinal1(csv_path: Path, encoding: str = "auto") -> tuple[pd
             attempted.append(enc)
             last_error = exc
     raise RuntimeError(f"Failed to read CSV with encodings {attempted}") from last_error
-
 
 
 def load_current_profile_ASSBfinal1(
@@ -145,7 +139,6 @@ def load_current_profile_ASSBfinal1(
             tmpdir.cleanup()
 
 
-
 def sample_profile_zoh_left_ASSBfinal1(
     t_query: torch.Tensor,
     t_ref: torch.Tensor,
@@ -163,3 +156,13 @@ def sample_profile_zoh_left_ASSBfinal1(
     idx = torch.clamp(idx, min=0, max=tref.numel() - 1)
     out = yref[idx]
     return out.reshape_as(tq)
+
+
+def select_step_indices_ASSBfinal1(t_query: torch.Tensor, t_nodes: torch.Tensor) -> torch.Tensor:
+    tq = torch.as_tensor(t_query, dtype=torch.float64, device=t_nodes.device).reshape(-1)
+    tref = torch.as_tensor(t_nodes, dtype=torch.float64, device=t_nodes.device).reshape(-1)
+    if tref.numel() < 2:
+        raise ValueError("Need at least two profile time nodes.")
+    idx = torch.bucketize(tq.detach(), tref, right=True) - 1
+    idx = torch.clamp(idx, min=0, max=tref.numel() - 2)
+    return idx

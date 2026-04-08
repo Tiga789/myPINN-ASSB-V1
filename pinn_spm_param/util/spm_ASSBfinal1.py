@@ -22,7 +22,6 @@ _RUNTIME_CONFIG_ASSBfinal1: dict[str, object] = {
 }
 
 
-
 def configure_runtime_ASSBfinal1(
     profile_path: str,
     profile_encoding: str = "auto",
@@ -35,11 +34,9 @@ def configure_runtime_ASSBfinal1(
     _RUNTIME_CONFIG_ASSBfinal1["cycle_end"] = cycle_end
 
 
-
 def _phie0_wrapper_ASSBfinal1(i0_a, j_a, F, R, T, Uocp_a0):
     del F
     return phie_linearized_experimental_1(i0_a, j_a, R, T, Uocp_a0)
-
 
 
 def _phis_c0_wrapper_ASSBfinal1(i0_a, j_a, F, R, T, Uocp_a0, j_c, i0_c, Uocp_c0):
@@ -48,12 +45,32 @@ def _phis_c0_wrapper_ASSBfinal1(i0_a, j_a, F, R, T, Uocp_a0, j_c, i0_c, Uocp_c0)
     return phis_c_linearized_experimental_1(i0_c, j_c, R, T, Uocp_c0, phie0)
 
 
-
 def _as_float(value: torch.Tensor | float) -> float:
     if isinstance(value, torch.Tensor):
         return float(value.detach().cpu().reshape(-1)[0])
     return float(value)
 
+
+def _estimate_cs_excursions_ASSBfinal1(params: dict, j_a_prof: torch.Tensor, j_c_prof: torch.Tensor, t_prof: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    device = t_prof.device
+    dtype = t_prof.dtype
+    dt = t_prof[1:] - t_prof[:-1]
+    if dt.numel() == 0:
+        tiny = torch.as_tensor(1e-3, dtype=dtype, device=device)
+        return tiny, tiny
+    # Average-particle balance: d cbar / dt = -3 j / R_s
+    delta_a = -torch.as_tensor(3.0, dtype=dtype, device=device) * j_a_prof[:-1] * dt / torch.clamp(params["Rs_a"], min=1e-30)
+    delta_c = -torch.as_tensor(3.0, dtype=dtype, device=device) * j_c_prof[:-1] * dt / torch.clamp(params["Rs_c"], min=1e-30)
+    cum_a = torch.cumsum(delta_a, dim=0)
+    cum_c = torch.cumsum(delta_c, dim=0)
+    max_a = torch.max(torch.abs(cum_a)) if cum_a.numel() > 0 else torch.as_tensor(0.0, dtype=dtype, device=device)
+    max_c = torch.max(torch.abs(cum_c)) if cum_c.numel() > 0 else torch.as_tensor(0.0, dtype=dtype, device=device)
+    # Give the network enough room for radial deviation beyond the particle average excursion.
+    exc_a = torch.maximum(torch.as_tensor(2.5, dtype=dtype, device=device) * max_a, torch.as_tensor(0.25, dtype=dtype, device=device))
+    exc_c = torch.maximum(torch.as_tensor(2.5, dtype=dtype, device=device) * max_c, torch.as_tensor(0.25, dtype=dtype, device=device))
+    exc_a = torch.minimum(exc_a, torch.as_tensor(float(params["csanmax"]) * 0.95, dtype=dtype, device=device))
+    exc_c = torch.minimum(exc_c, torch.as_tensor(float(params["cscamax"]) * 0.95, dtype=dtype, device=device))
+    return exc_a, exc_c
 
 
 def makeParams() -> dict:
@@ -76,6 +93,7 @@ def makeParams() -> dict:
 
     t_prof = torch.as_tensor(profile["time_s"], dtype=dtype, device=device)
     i_prof = torch.as_tensor(profile["current_a"], dtype=dtype, device=device)
+    dt_prof = t_prof[1:] - t_prof[:-1]
 
     deg_i0_a_ref = params["default_deg_i0_a"]
     deg_ds_c_ref = params["default_deg_ds_c"]
@@ -103,12 +121,6 @@ def makeParams() -> dict:
     params["rescale_R"] = torch.maximum(params["Rs_a"], params["Rs_c"])
     params["rescale_T"] = torch.clamp(t_prof[-1], min=torch.as_tensor(1e-16, dtype=dtype, device=device))
 
-    params["mag_cs_a"] = torch.as_tensor(25.0, dtype=dtype, device=device)
-    params["mag_cs_c"] = torch.as_tensor(32.5, dtype=dtype, device=device)
-    params["mag_phis_c"] = torch.as_tensor(4.25, dtype=dtype, device=device)
-    params["mag_phie"] = torch.as_tensor(0.15, dtype=dtype, device=device)
-    params["mag_ce"] = torch.as_tensor(1.2, dtype=dtype, device=device)
-
     params["ce0"] = torch.as_tensor(1.2, dtype=dtype, device=device)
     params["ce_a0"] = params["ce0"]
     params["ce_c0"] = params["ce0"]
@@ -126,6 +138,7 @@ def makeParams() -> dict:
     params["j_a_abs_max"] = torch.max(torch.abs(j_a_prof))
     params["j_c_abs_max"] = torch.max(torch.abs(j_c_prof))
     params["profile_time_s"] = t_prof
+    params["profile_dt_s"] = dt_prof
     params["profile_current_a"] = i_prof
     params["profile_j_a"] = j_a_prof
     params["profile_j_c"] = j_c_prof
@@ -135,6 +148,25 @@ def makeParams() -> dict:
     params["profile_encoding"] = str(profile["encoding"])
     params["profile_cycle_start"] = int(profile["cycle_start"])
     params["profile_cycle_end"] = int(profile["cycle_end"])
+
+    # Use the same radial discretization as the soft-label generator.
+    params["solver_n_r"] = 64
+    params["profile_r_a_grid"] = torch.linspace(
+        torch.as_tensor(0.0, dtype=dtype, device=device),
+        params["Rs_a"],
+        int(params["solver_n_r"]),
+        dtype=dtype,
+        device=device,
+    )
+    params["profile_r_c_grid"] = torch.linspace(
+        torch.as_tensor(0.0, dtype=dtype, device=device),
+        params["Rs_c"],
+        int(params["solver_n_r"]),
+        dtype=dtype,
+        device=device,
+    )
+    params["profile_dR_a"] = params["Rs_a"] / torch.as_tensor(int(params["solver_n_r"]) - 1, dtype=dtype, device=device)
+    params["profile_dR_c"] = params["Rs_c"] / torch.as_tensor(int(params["solver_n_r"]) - 1, dtype=dtype, device=device)
 
     i0_a0 = params["i0_a"](
         cs_a0,
@@ -162,14 +194,36 @@ def makeParams() -> dict:
     params["Uocp_c0"] = Uocp_c0
     params["phis_c0"] = _phis_c0_wrapper_ASSBfinal1
 
-    params["rescale_cs_a"] = params["csanmax"]
-    params["rescale_cs_c"] = params["cscamax"]
-    params["rescale_phis_c"] = torch.as_tensor(0.35, dtype=dtype, device=device)
-    params["rescale_phie"] = torch.as_tensor(0.15, dtype=dtype, device=device)
+    cs_a_exc, cs_c_exc = _estimate_cs_excursions_ASSBfinal1(params, j_a_prof, j_c_prof, t_prof)
+    params["cs_a_excursion_est"] = cs_a_exc
+    params["cs_c_excursion_est"] = cs_c_exc
+
+    phie_scale = torch.maximum(
+        torch.abs((params["R"] * params["T"] / torch.clamp(i0_a0, min=1e-30)) * params["j_a_abs_max"]),
+        torch.as_tensor(0.05, dtype=dtype, device=device),
+    )
+    phis_scale = torch.maximum(
+        torch.abs((params["R"] * params["T"] / torch.clamp(i0_c0, min=1e-30)) * params["j_c_abs_max"]),
+        torch.as_tensor(0.05, dtype=dtype, device=device),
+    )
+    params["phie_excursion_est"] = torch.as_tensor(1.5, dtype=dtype, device=device) * phie_scale
+    params["phis_c_excursion_est"] = torch.as_tensor(1.5, dtype=dtype, device=device) * phis_scale
+
+    params["mag_cs_a"] = torch.maximum(params["cs_a_excursion_est"], torch.as_tensor(1e-3, dtype=dtype, device=device))
+    params["mag_cs_c"] = torch.maximum(params["cs_c_excursion_est"], torch.as_tensor(1e-3, dtype=dtype, device=device))
+    params["mag_phie"] = torch.maximum(params["phie_excursion_est"], torch.as_tensor(1e-3, dtype=dtype, device=device))
+    params["mag_phis_c"] = torch.maximum(params["phis_c_excursion_est"], torch.as_tensor(1e-3, dtype=dtype, device=device))
+    params["mag_ce"] = torch.as_tensor(1.2, dtype=dtype, device=device)
+
+    params["rescale_cs_a"] = params["cs_a_excursion_est"]
+    params["rescale_cs_c"] = params["cs_c_excursion_est"]
+    params["rescale_phis_c"] = params["phis_c_excursion_est"]
+    params["rescale_phie"] = params["phie_excursion_est"]
 
     print(
         "INFO: ASSBfinal1 profile loaded | "
         f"rows={t_prof.numel()} t_end={_as_float(t_prof[-1]):.6f}s I0={_as_float(i_prof[0]):.8f}A "
-        f"cycles={profile['cycle_start']}-{profile['cycle_end']} encoding={profile['encoding']}"
+        f"cycles={profile['cycle_start']}-{profile['cycle_end']} encoding={profile['encoding']} "
+        f"n_r={int(params['solver_n_r'])}"
     )
     return params

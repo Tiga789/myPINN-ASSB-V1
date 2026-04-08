@@ -3,21 +3,20 @@ from __future__ import annotations
 import numpy as np
 import torch
 
-from current_profile_ASSBfinal1 import sample_profile_zoh_left_ASSBfinal1
+from current_profile_ASSBfinal1 import select_step_indices_ASSBfinal1
 from thermo_experimental_1 import (
+    grad_ds_c_cs_c_experimental_1,
     phie_linearized_experimental_1,
     phis_c_linearized_experimental_1,
 )
-from torch_utils import ensure_2d, grad, safe_mean_square, to_tensor
+from torch_utils import ensure_2d, safe_mean_square, to_tensor
 
 
 torch.set_default_dtype(torch.float64)
 
 
-
 def _stack_term_list(term_groups):
     return [ensure_2d(term[0]) for term in term_groups]
-
 
 
 def _sum_sq(term_groups):
@@ -29,22 +28,139 @@ def _sum_sq(term_groups):
     return total
 
 
-
 def _zero(self):
     return torch.zeros((1, 1), dtype=torch.float64, device=self.device)
 
 
+def _gradient_batch_ASSBfinal1(y: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
+    grad = torch.zeros_like(y)
+    x1 = torch.as_tensor(x, dtype=torch.float64, device=y.device).reshape(-1)
+    n = y.shape[1]
+    if n < 2:
+        return grad
+    dx0 = torch.clamp(x1[1] - x1[0], min=1e-30)
+    dxl = torch.clamp(x1[-1] - x1[-2], min=1e-30)
+    grad[:, 0] = (y[:, 1] - y[:, 0]) / dx0
+    grad[:, -1] = (y[:, -1] - y[:, -2]) / dxl
+    if n > 2:
+        denom = torch.clamp(x1[2:] - x1[:-2], min=1e-30).reshape(1, -1)
+        grad[:, 1:-1] = (y[:, 2:] - y[:, :-2]) / denom
+    return grad
 
-def _profile_flux_of_t_ASSBfinal1(self, t_query, which: str) -> torch.Tensor:
-    t_ref = ensure_2d(self.params["profile_time_s"], device=self.device).reshape(-1)
-    if which == "a":
-        y_ref = ensure_2d(self.params["profile_j_a"], device=self.device).reshape(-1)
-    elif which == "c":
-        y_ref = ensure_2d(self.params["profile_j_c"], device=self.device).reshape(-1)
+
+def _tridiag_batched_ASSBfinal1(ds: torch.Tensor, dt: torch.Tensor, dr: torch.Tensor) -> torch.Tensor:
+    ds_t = torch.as_tensor(ds, dtype=torch.float64)
+    dt_t = torch.as_tensor(dt, dtype=torch.float64, device=ds_t.device).reshape(-1, 1)
+    dr_t = torch.as_tensor(dr, dtype=torch.float64, device=ds_t.device)
+    batch, n_r = ds_t.shape
+    a = torch.as_tensor(1.0, dtype=torch.float64, device=ds_t.device) + torch.as_tensor(2.0, dtype=torch.float64, device=ds_t.device) * ds_t * dt_t / (dr_t**2)
+    b = -ds_t * dt_t / (dr_t**2)
+    mat = torch.zeros((batch, n_r, n_r), dtype=torch.float64, device=ds_t.device)
+    idx = torch.arange(n_r, device=ds_t.device)
+    mat[:, idx, idx] = a
+    if n_r > 1:
+        mat[:, idx[1:], idx[:-1]] = b[:, 1:]
+        mat[:, idx[:-1], idx[1:]] = b[:, :-1]
+    mat[:, 0, :] = torch.as_tensor(0.0, dtype=torch.float64, device=ds_t.device)
+    mat[:, -1, :] = torch.as_tensor(0.0, dtype=torch.float64, device=ds_t.device)
+    mat[:, 0, 0] = -torch.as_tensor(1.0, dtype=torch.float64, device=ds_t.device) / dr_t
+    mat[:, 0, 1] = torch.as_tensor(1.0, dtype=torch.float64, device=ds_t.device) / dr_t
+    mat[:, -1, -2] = -torch.as_tensor(1.0, dtype=torch.float64, device=ds_t.device) / dr_t
+    mat[:, -1, -1] = torch.as_tensor(1.0, dtype=torch.float64, device=ds_t.device) / dr_t
+    return mat
+
+
+def _rhs_batched_ASSBfinal1(
+    dt: torch.Tensor,
+    r: torch.Tensor,
+    ddr_cs: torch.Tensor,
+    ds: torch.Tensor,
+    ddDs_cs: torch.Tensor,
+    cs: torch.Tensor,
+    bound_grad: torch.Tensor,
+) -> torch.Tensor:
+    dt_t = torch.as_tensor(dt, dtype=torch.float64, device=cs.device).reshape(-1, 1)
+    r_t = torch.as_tensor(r, dtype=torch.float64, device=cs.device).reshape(1, -1)
+    safe_r = torch.clamp(r_t, min=1e-12)
+    rhs = dt_t * (torch.as_tensor(2.0, dtype=torch.float64, device=cs.device) / safe_r) * ddr_cs * ds
+    rhs = rhs + dt_t * (ddr_cs**2) * ddDs_cs
+    rhs = rhs + cs
+    rhs[:, 0] = torch.as_tensor(0.0, dtype=torch.float64, device=cs.device)
+    rhs[:, -1] = torch.as_tensor(bound_grad, dtype=torch.float64, device=cs.device).reshape(-1)
+    return rhs
+
+
+def _select_step_batch_ASSBfinal1(self, t_query: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    t_nodes = torch.as_tensor(self.params["profile_time_s"], dtype=torch.float64, device=self.device).reshape(-1)
+    k = select_step_indices_ASSBfinal1(ensure_2d(t_query, device=self.device), t_nodes)
+    k = torch.unique(k, sorted=False)
+    t_prev = t_nodes[k].reshape(-1, 1)
+    t_next = t_nodes[k + 1].reshape(-1, 1)
+    dt = (t_next - t_prev).reshape(-1, 1)
+    j_a = torch.as_tensor(self.params["profile_j_a"], dtype=torch.float64, device=self.device).reshape(-1)[k].reshape(-1, 1)
+    j_c = torch.as_tensor(self.params["profile_j_c"], dtype=torch.float64, device=self.device).reshape(-1)[k].reshape(-1, 1)
+    positive = (dt.reshape(-1) > 0.0)
+    if bool(torch.any(positive).item()):
+        t_prev = t_prev[positive]
+        t_next = t_next[positive]
+        dt = dt[positive]
+        j_a = j_a[positive]
+        j_c = j_c[positive]
+    return t_prev, t_next, dt, j_a, j_c
+
+
+def _eval_branch_on_grid_ASSBfinal1(self, t_nodes, r_grid, deg_i0_a, deg_ds_c, out_index: int, rescale_name: str):
+    t_nodes = ensure_2d(t_nodes, device=self.device)
+    deg_i0_a = ensure_2d(deg_i0_a, device=self.device)
+    deg_ds_c = ensure_2d(deg_ds_c, device=self.device)
+    r_grid = torch.as_tensor(r_grid, dtype=torch.float64, device=self.device).reshape(-1)
+    batch = t_nodes.shape[0]
+    n_r = r_grid.numel()
+
+    t_flat = t_nodes.repeat_interleave(n_r, dim=0)
+    r_flat = r_grid.reshape(1, -1).repeat(batch, 1).reshape(-1, 1)
+    deg_i0_flat = deg_i0_a.repeat_interleave(n_r, dim=0)
+    deg_ds_flat = deg_ds_c.repeat_interleave(n_r, dim=0)
+
+    outputs = self.model(
+        [
+            t_flat / self.params["rescale_T"],
+            r_flat / self.params["rescale_R"],
+            self.rescale_param(deg_i0_flat, self.ind_deg_i0_a),
+            self.rescale_param(deg_ds_flat, self.ind_deg_ds_c),
+        ],
+        training=True,
+    )
+    raw = outputs[out_index]
+    if rescale_name == "cs_a":
+        val = self.rescaleCs_a(raw, t_flat, r_flat, deg_i0_flat, deg_ds_flat, clip=False)
+    elif rescale_name == "cs_c":
+        val = self.rescaleCs_c(raw, t_flat, r_flat, deg_i0_flat, deg_ds_flat, clip=False)
     else:
-        raise ValueError(which)
-    return sample_profile_zoh_left_ASSBfinal1(ensure_2d(t_query, device=self.device), t_ref, y_ref)
+        raise ValueError(rescale_name)
+    return val.reshape(batch, n_r)
 
+
+def _eval_potential_ASSBfinal1(self, t_nodes, deg_i0_a, deg_ds_c, out_index: int, which: str):
+    t_nodes = ensure_2d(t_nodes, device=self.device)
+    deg_i0_a = ensure_2d(deg_i0_a, device=self.device)
+    deg_ds_c = ensure_2d(deg_ds_c, device=self.device)
+    r_surf = self.params["Rs_a"] * torch.ones_like(t_nodes, dtype=torch.float64, device=self.device)
+    outputs = self.model(
+        [
+            t_nodes / self.params["rescale_T"],
+            r_surf / self.params["rescale_R"],
+            self.rescale_param(deg_i0_a, self.ind_deg_i0_a),
+            self.rescale_param(deg_ds_c, self.ind_deg_ds_c),
+        ],
+        training=True,
+    )
+    raw = outputs[out_index]
+    if which == "phie":
+        return self.rescalePhie(raw, t_nodes, deg_i0_a, deg_ds_c)
+    if which == "phis_c":
+        return self.rescalePhis_c(raw, t_nodes, deg_i0_a, deg_ds_c)
+    raise ValueError(which)
 
 
 def loss_fn(interiorTerms, boundaryTerms, dataTerms, regularizationTerms, alpha):
@@ -52,7 +168,6 @@ def loss_fn(interiorTerms, boundaryTerms, dataTerms, regularizationTerms, alpha)
     bound_loss = _sum_sq(boundaryTerms)
     data_loss = _sum_sq(dataTerms)
     reg_loss = _sum_sq(regularizationTerms)
-
     global_loss = (
         float(alpha[0]) * int_loss
         + float(alpha[1]) * bound_loss
@@ -68,10 +183,8 @@ def loss_fn(interiorTerms, boundaryTerms, dataTerms, regularizationTerms, alpha)
     )
 
 
-
 def loss_fn_lbfgs(interiorTerms, boundaryTerms, dataTerms, regularizationTerms, alpha):
     return loss_fn(interiorTerms, boundaryTerms, dataTerms, regularizationTerms, alpha)
-
 
 
 def loss_fn_lbfgs_SA(
@@ -88,7 +201,6 @@ def loss_fn_lbfgs_SA(
     return loss_fn(interiorTerms, boundaryTerms, dataTerms, regularizationTerms, alpha)
 
 
-
 def loss_fn_lbfgs_annealing(
     interiorTerms,
     boundaryTerms,
@@ -101,7 +213,6 @@ def loss_fn_lbfgs_annealing(
     alpha,
 ):
     return loss_fn(interiorTerms, boundaryTerms, dataTerms, regularizationTerms, alpha)
-
 
 
 def loss_fn_dynamicAttention_tensor(
@@ -127,7 +238,6 @@ def loss_fn_dynamicAttention_tensor(
     )
 
 
-
 def loss_fn_annealing(
     interiorTerms,
     boundaryTerms,
@@ -146,48 +256,30 @@ def loss_fn_annealing(
     return loss_fn(interiorTerms, boundaryTerms, dataTerms, regularizationTerms, alpha)
 
 
-
 def setResidualRescaling(self, weights):
-    cs_a0 = float(to_tensor(self.params["cs_a0"]).detach().cpu().reshape(-1)[0])
-    cs_c0 = float(to_tensor(self.params["cs_c0"]).detach().cpu().reshape(-1)[0])
-    Ds_a = float(self.params["D_s_a"](self.params["T"], self.params["R"]).detach().cpu().reshape(-1)[0])
-    Ds_c = float(
-        self.params["D_s_c"](
-            self.params["cs_c0"],
-            self.params["T"],
-            self.params["R"],
-            self.params["cscamax"],
-            self.params["deg_ds_c_ref"],
-        )
-        .detach()
-        .cpu()
-        .reshape(-1)[0]
-    )
-    j_a_mag = max(float(to_tensor(self.params["j_a_abs_max"]).detach().cpu().reshape(-1)[0]), 1e-30)
-    j_c_mag = max(float(to_tensor(self.params["j_c_abs_max"]).detach().cpu().reshape(-1)[0]), 1e-30)
-    C = max(abs(float(to_tensor(self.params["C"]).detach().cpu().reshape(-1)[0])), 1e-30)
-
-    self.phie_transp_resc = np.float64(1.0) / j_a_mag
-    self.phis_c_transp_resc = np.float64(1.0) / j_c_mag
-    self.cs_a_transp_resc = (np.float64(3600.0) / np.float64(C)) / max(float(to_tensor(self.params["csanmax"]).cpu().reshape(-1)[0]), 1e-30)
-    self.cs_c_transp_resc = (np.float64(3600.0) / np.float64(C)) / max(float(to_tensor(self.params["cscamax"]).cpu().reshape(-1)[0]), 1e-30)
+    cs_a_exc = max(float(to_tensor(self.params["cs_a_excursion_est"]).detach().cpu().reshape(-1)[0]), 1e-8)
+    cs_c_exc = max(float(to_tensor(self.params["cs_c_excursion_est"]).detach().cpu().reshape(-1)[0]), 1e-8)
+    phie_exc = max(float(to_tensor(self.params["phie_excursion_est"]).detach().cpu().reshape(-1)[0]), 1e-8)
+    phis_exc = max(float(to_tensor(self.params["phis_c_excursion_est"]).detach().cpu().reshape(-1)[0]), 1e-8)
+    Rs_a = max(float(to_tensor(self.params["Rs_a"]).detach().cpu().reshape(-1)[0]), 1e-12)
+    Rs_c = max(float(to_tensor(self.params["Rs_c"]).detach().cpu().reshape(-1)[0]), 1e-12)
 
     if self.activeInt:
         if weights is None:
             w_phie_int = np.float64(1.0)
             w_phis_c_int = np.float64(1.0)
-            w_cs_a_int = np.float64(50.0)
-            w_cs_c_int = np.float64(50.0)
+            w_cs_a_int = np.float64(20.0)
+            w_cs_c_int = np.float64(20.0)
         else:
             w_phie_int = weights["phie_int"]
             w_phis_c_int = weights["phis_c_int"]
             w_cs_a_int = weights["cs_a_int"]
             w_cs_c_int = weights["cs_c_int"]
         self.interiorTerms_rescale_unweighted = [
-            abs(self.phie_transp_resc),
-            abs(self.phis_c_transp_resc),
-            abs(self.cs_a_transp_resc),
-            abs(self.cs_c_transp_resc),
+            np.float64(1.0 / phie_exc),
+            np.float64(1.0 / phis_exc),
+            np.float64(1.0 / cs_a_exc),
+            np.float64(1.0 / cs_c_exc),
         ]
         self.interiorTerms_rescale = [
             w_phie_int * self.interiorTerms_rescale_unweighted[0],
@@ -199,26 +291,22 @@ def setResidualRescaling(self, weights):
         self.interiorTerms_rescale_unweighted = [np.float64(0.0)]
         self.interiorTerms_rescale = [np.float64(0.0)]
 
-    self.cs_a_bound_resc = Ds_a / j_a_mag
-    self.cs_c_bound_resc = Ds_c / j_c_mag
-    self.cs_a_bound_j_resc = Ds_a / j_a_mag
-    self.cs_c_bound_j_resc = Ds_c / j_c_mag
     if self.activeBound:
         if weights is None:
             w_cs_a_rmin_bound = np.float64(1.0)
             w_cs_c_rmin_bound = np.float64(1.0)
-            w_cs_a_rmax_bound = np.float64(10.0)
-            w_cs_c_rmax_bound = np.float64(10.0)
+            w_cs_a_rmax_bound = np.float64(5.0)
+            w_cs_c_rmax_bound = np.float64(5.0)
         else:
             w_cs_a_rmin_bound = weights["cs_a_rmin_bound"]
             w_cs_c_rmin_bound = weights["cs_c_rmin_bound"]
             w_cs_a_rmax_bound = weights["cs_a_rmax_bound"]
             w_cs_c_rmax_bound = weights["cs_c_rmax_bound"]
         self.boundaryTerms_rescale_unweighted = [
-            abs(self.cs_a_bound_resc),
-            abs(self.cs_c_bound_resc),
-            abs(self.cs_a_bound_j_resc),
-            abs(self.cs_c_bound_j_resc),
+            np.float64(Rs_a / cs_a_exc),
+            np.float64(Rs_c / cs_c_exc),
+            np.float64(Rs_a / cs_a_exc),
+            np.float64(Rs_c / cs_c_exc),
         ]
         self.boundaryTerms_rescale = [
             w_cs_a_rmin_bound * self.boundaryTerms_rescale_unweighted[0],
@@ -242,12 +330,11 @@ def setResidualRescaling(self, weights):
             w_phis_c_dat = weights["phis_c_dat"]
             w_cs_a_dat = weights["cs_a_dat"]
             w_cs_c_dat = weights["cs_c_dat"]
-
         self.dataTerms_rescale_unweighted = [
-            np.float64(1.0) / np.float64(float(to_tensor(self.params["mag_phie"]).cpu().reshape(-1)[0])),
-            np.float64(1.0) / np.float64(float(to_tensor(self.params["mag_phis_c"]).cpu().reshape(-1)[0])),
-            np.float64(1.0) / np.float64(float(to_tensor(self.params["mag_cs_a"]).cpu().reshape(-1)[0])),
-            np.float64(1.0) / np.float64(float(to_tensor(self.params["mag_cs_c"]).cpu().reshape(-1)[0])),
+            np.float64(1.0 / max(float(to_tensor(self.params["mag_phie"]).cpu().reshape(-1)[0]), 1e-8)),
+            np.float64(1.0 / max(float(to_tensor(self.params["mag_phis_c"]).cpu().reshape(-1)[0]), 1e-8)),
+            np.float64(1.0 / max(float(to_tensor(self.params["mag_cs_a"]).cpu().reshape(-1)[0]), 1e-8)),
+            np.float64(1.0 / max(float(to_tensor(self.params["mag_cs_c"]).cpu().reshape(-1)[0]), 1e-8)),
         ]
         self.dataTerms_rescale = [
             w_phie_dat * self.dataTerms_rescale_unweighted[0],
@@ -267,7 +354,6 @@ def setResidualRescaling(self, weights):
         self.regTerms_rescale = [np.float64(0.0)]
 
 
-
 def data_loss(self, x_batch_trainList, x_cs_batch_trainList, x_params_batch_trainList, y_batch_trainList):
     if not self.activeData:
         return [[_zero(self)]]
@@ -285,27 +371,24 @@ def data_loss(self, x_batch_trainList, x_cs_batch_trainList, x_params_batch_trai
         ],
         training=True,
     )
-    phie_pred_non_rescaled = out_phie[self.ind_phie]
     phie_pred_rescaled = self.rescalePhie(
-        phie_pred_non_rescaled,
+        out_phie[self.ind_phie],
         x_batch_trainList[self.ind_phie_data][:, self.ind_t],
         x_params_batch_trainList[self.ind_phie_data][:, self.ind_deg_i0_a],
         x_params_batch_trainList[self.ind_phie_data][:, self.ind_deg_ds_c],
     )
 
-    surfR_a = self.params["Rs_a"] * torch.ones_like(ensure_2d(x_batch_trainList[self.ind_phis_c_data][:, self.ind_t], device=self.device))
     out_phis_c = self.model(
         [
             ensure_2d(x_batch_trainList[self.ind_phis_c_data][:, self.ind_t], device=self.device) / resc_t,
-            surfR_a / resc_r,
+            surfR_a[: ensure_2d(x_batch_trainList[self.ind_phis_c_data][:, self.ind_t], device=self.device).shape[0]] / resc_r,
             self.rescale_param(x_params_batch_trainList[self.ind_phis_c_data][:, self.ind_deg_i0_a], self.ind_deg_i0_a),
             self.rescale_param(x_params_batch_trainList[self.ind_phis_c_data][:, self.ind_deg_ds_c], self.ind_deg_ds_c),
         ],
         training=True,
     )
-    phis_c_pred_non_rescaled = out_phis_c[self.ind_phis_c]
     phis_c_pred_rescaled = self.rescalePhis_c(
-        phis_c_pred_non_rescaled,
+        out_phis_c[self.ind_phis_c],
         x_batch_trainList[self.ind_phis_c_data][:, self.ind_t],
         x_params_batch_trainList[self.ind_phis_c_data][:, self.ind_deg_i0_a],
         x_params_batch_trainList[self.ind_phis_c_data][:, self.ind_deg_ds_c],
@@ -355,66 +438,34 @@ def data_loss(self, x_batch_trainList, x_cs_batch_trainList, x_params_batch_trai
     ]
 
 
-
 def interior_loss(self, int_col_pts=None, int_col_params=None, tmax=None):
     if not self.activeInt:
         return [[_zero(self)]]
 
-    t, r_a, r_c, rSurf_a, rSurf_c, deg_i0_a, deg_ds_c = self._prepare_interior_batch(int_col_pts, int_col_params, tmax)
-    resc_t = self.params["rescale_T"]
-    resc_r = self.params["rescale_R"]
-    ce = self.params["ce0"] * torch.ones_like(t, dtype=torch.float64)
+    t, _, _, _, _, deg_i0_a, deg_ds_c = self._prepare_interior_batch(int_col_pts, int_col_params, tmax)
+    t_prev, t_next, dt, j_a, j_c = _select_step_batch_ASSBfinal1(self, t)
+    if t_prev.numel() == 0:
+        return [[_zero(self)], [_zero(self)], [_zero(self)], [_zero(self)]]
 
-    r_a = r_a.clone().detach().requires_grad_(True)
-    r_c = r_c.clone().detach().requires_grad_(True)
-    t = t.clone().detach().requires_grad_(True)
+    deg_i0_a = ensure_2d(deg_i0_a, device=self.device)[: t_prev.shape[0]]
+    deg_ds_c = ensure_2d(deg_ds_c, device=self.device)[: t_prev.shape[0]]
 
-    output_a = self.model(
-        [
-            t / resc_t,
-            r_a / resc_r,
-            self.rescale_param(deg_i0_a, self.ind_deg_i0_a),
-            self.rescale_param(deg_ds_c, self.ind_deg_ds_c),
-        ],
-        training=True,
-    )
-    output_c = self.model(
-        [
-            t / resc_t,
-            r_c / resc_r,
-            self.rescale_param(deg_i0_a, self.ind_deg_i0_a),
-            self.rescale_param(deg_ds_c, self.ind_deg_ds_c),
-        ],
-        training=True,
-    )
-    output_surf_a = self.model(
-        [
-            t / resc_t,
-            rSurf_a / resc_r,
-            self.rescale_param(deg_i0_a, self.ind_deg_i0_a),
-            self.rescale_param(deg_ds_c, self.ind_deg_ds_c),
-        ],
-        training=True,
-    )
-    output_surf_c = self.model(
-        [
-            t / resc_t,
-            rSurf_c / resc_r,
-            self.rescale_param(deg_i0_a, self.ind_deg_i0_a),
-            self.rescale_param(deg_ds_c, self.ind_deg_ds_c),
-        ],
-        training=True,
-    )
+    r_a_grid = self.params["profile_r_a_grid"]
+    r_c_grid = self.params["profile_r_c_grid"]
+    dR_a = self.params["profile_dR_a"]
+    dR_c = self.params["profile_dR_c"]
 
-    phie = self.rescalePhie(output_a[self.ind_phie], t, deg_i0_a, deg_ds_c)
-    phis_c = self.rescalePhis_c(output_c[self.ind_phis_c], t, deg_i0_a, deg_ds_c)
-    cs_a = self.rescaleCs_a(output_a[self.ind_cs_a], t, r_a, deg_i0_a, deg_ds_c, clip=False)
-    cs_c = self.rescaleCs_c(output_c[self.ind_cs_c], t, r_c, deg_i0_a, deg_ds_c, clip=False)
-    cse_a = self.rescaleCs_a(output_surf_a[self.ind_cs_a], t, rSurf_a, deg_i0_a, deg_ds_c, clip=False)
-    cse_c = self.rescaleCs_c(output_surf_c[self.ind_cs_c], t, rSurf_c, deg_i0_a, deg_ds_c, clip=False)
+    cs_a_prev = _eval_branch_on_grid_ASSBfinal1(self, t_prev, r_a_grid, deg_i0_a, deg_ds_c, self.ind_cs_a, "cs_a")
+    cs_a_next = _eval_branch_on_grid_ASSBfinal1(self, t_next, r_a_grid, deg_i0_a, deg_ds_c, self.ind_cs_a, "cs_a")
+    cs_c_prev = _eval_branch_on_grid_ASSBfinal1(self, t_prev, r_c_grid, deg_i0_a, deg_ds_c, self.ind_cs_c, "cs_c")
+    cs_c_next = _eval_branch_on_grid_ASSBfinal1(self, t_next, r_c_grid, deg_i0_a, deg_ds_c, self.ind_cs_c, "cs_c")
 
-    i0_a = self.params["i0_a"](
-        cse_a,
+    ce = self.params["ce0"] * torch.ones_like(t_prev, dtype=torch.float64)
+    cse_a_prev = cs_a_prev[:, -1].reshape(-1, 1)
+    cse_c_prev = cs_c_prev[:, -1].reshape(-1, 1)
+
+    i0_a_prev = self.params["i0_a"](
+        cse_a_prev,
         ce,
         self.params["T"],
         self.params["alpha_a"],
@@ -422,130 +473,109 @@ def interior_loss(self, int_col_pts=None, int_col_params=None, tmax=None):
         self.params["R"],
         deg_i0_a,
     )
-    i0_c = self.params["i0_c"](
-        cse_c,
+    i0_c_prev = self.params["i0_c"](
+        cse_c_prev,
         ce,
         self.params["T"],
         self.params["alpha_c"],
         self.params["cscamax"],
         self.params["R"],
     )
-    uocp_a = self.params["Uocp_a"](cse_a, self.params["csanmax"])
-    uocp_c = self.params["Uocp_c"](cse_c, self.params["cscamax"])
-    j_a_rhs = _profile_flux_of_t_ASSBfinal1(self, t, "a")
-    j_c_rhs = _profile_flux_of_t_ASSBfinal1(self, t, "c")
+    Uocp_a_prev = self.params["Uocp_a"](cse_a_prev, self.params["csanmax"])
+    Uocp_c_prev = self.params["Uocp_c"](cse_c_prev, self.params["cscamax"])
 
-    phie_rhs = phie_linearized_experimental_1(i0_a, j_a_rhs, self.params["R"], self.params["T"], uocp_a)
-    phis_c_rhs = phis_c_linearized_experimental_1(i0_c, j_c_rhs, self.params["R"], self.params["T"], uocp_c, phie)
+    phie_pred_next = _eval_potential_ASSBfinal1(self, t_next, deg_i0_a, deg_ds_c, self.ind_phie, "phie")
+    phie_rhs_next = phie_linearized_experimental_1(i0_a_prev, j_a, self.params["R"], self.params["T"], Uocp_a_prev)
 
-    cs_a_r = grad(cs_a, r_a)
-    ds_a = self.params["D_s_a"](self.params["T"], self.params["R"]) + np.float64(0.0) * r_a
-    cs_c_r = grad(cs_c, r_c)
-    ds_c = self.params["D_s_c"](
-        cs_c,
+    phis_c_pred_next = _eval_potential_ASSBfinal1(self, t_next, deg_i0_a, deg_ds_c, self.ind_phis_c, "phis_c")
+    phis_c_rhs_next = phis_c_linearized_experimental_1(i0_c_prev, j_c, self.params["R"], self.params["T"], Uocp_c_prev, phie_rhs_next)
+
+    ds_a_prev = self.params["D_s_a"](self.params["T"], self.params["R"]) * torch.ones_like(cs_a_prev)
+    grad_cs_a_prev = _gradient_batch_ASSBfinal1(cs_a_prev, r_a_grid)
+    A_a = _tridiag_batched_ASSBfinal1(ds_a_prev, dt, dR_a)
+    B_a = _rhs_batched_ASSBfinal1(
+        dt,
+        r_a_grid,
+        grad_cs_a_prev,
+        ds_a_prev,
+        torch.zeros_like(cs_a_prev),
+        cs_a_prev,
+        -j_a / torch.clamp(ds_a_prev[:, -1].reshape(-1, 1), min=1e-30),
+    )
+    res_cs_a = torch.bmm(A_a, cs_a_next.unsqueeze(-1)).squeeze(-1) - B_a
+
+    ds_c_prev = self.params["D_s_c"](
+        cs_c_prev,
         self.params["T"],
         self.params["R"],
         self.params["cscamax"],
         deg_ds_c,
-    ) + np.float64(0.0) * r_c
-
-    cs_a_t = grad(cs_a, t)
-    cs_a_r_r = grad(cs_a_r, r_a)
-    ds_a_r = grad(ds_a, r_a)
-
-    cs_c_t = grad(cs_c, t)
-    cs_c_r_r = grad(cs_c_r, r_c)
-    ds_c_r = grad(ds_c, r_c)
+    )
+    grad_Ds_c_prev = grad_ds_c_cs_c_experimental_1(
+        cs_c_prev,
+        self.params["T"],
+        self.params["R"],
+        self.params["cscamax"],
+        deg_ds_c,
+    )
+    grad_cs_c_prev = _gradient_batch_ASSBfinal1(cs_c_prev, r_c_grid)
+    A_c = _tridiag_batched_ASSBfinal1(ds_c_prev, dt, dR_c)
+    B_c = _rhs_batched_ASSBfinal1(
+        dt,
+        r_c_grid,
+        grad_cs_c_prev,
+        ds_c_prev,
+        grad_Ds_c_prev,
+        cs_c_prev,
+        -j_c / torch.clamp(ds_c_prev[:, -1].reshape(-1, 1), min=1e-30),
+    )
+    res_cs_c = torch.bmm(A_c, cs_c_next.unsqueeze(-1)).squeeze(-1) - B_c
 
     return [
-        [phie - phie_rhs],
-        [phis_c - phis_c_rhs],
-        [cs_a_t - cs_a_r_r * ds_a - np.float64(2.0) * ds_a * cs_a_r / r_a - ds_a_r * cs_a_r],
-        [cs_c_t - cs_c_r_r * ds_c - np.float64(2.0) * ds_c * cs_c_r / r_c - ds_c_r * cs_c_r],
+        [phie_pred_next - phie_rhs_next],
+        [phis_c_pred_next - phis_c_rhs_next],
+        [res_cs_a],
+        [res_cs_c],
     ]
-
 
 
 def boundary_loss(self, bound_col_pts=None, bound_col_params=None, tmax=None):
     if not self.activeBound:
         return [[_zero(self)]]
 
-    t_bound, r_0_bound, r_max_a_bound, r_max_c_bound, deg_i0_a_bound, deg_ds_c_bound = self._prepare_boundary_batch(bound_col_pts, bound_col_params, tmax)
+    t_bound, _, _, _, deg_i0_a_bound, deg_ds_c_bound = self._prepare_boundary_batch(bound_col_pts, bound_col_params, tmax)
+    t_prev, t_next, dt, j_a, j_c = _select_step_batch_ASSBfinal1(self, t_bound)
+    if t_prev.numel() == 0:
+        return [[_zero(self)], [_zero(self)], [_zero(self)], [_zero(self)]]
 
-    resc_t = self.params["rescale_T"]
-    resc_r = self.params["rescale_R"]
+    deg_i0_a_bound = ensure_2d(deg_i0_a_bound, device=self.device)[: t_prev.shape[0]]
+    deg_ds_c_bound = ensure_2d(deg_ds_c_bound, device=self.device)[: t_prev.shape[0]]
 
-    r_0_bound = r_0_bound.clone().detach().requires_grad_(True)
-    r_max_a_bound = r_max_a_bound.clone().detach().requires_grad_(True)
-    r_max_c_bound = r_max_c_bound.clone().detach().requires_grad_(True)
+    r_a_grid = self.params["profile_r_a_grid"]
+    r_c_grid = self.params["profile_r_c_grid"]
 
-    output_r0_a_bound = self.model(
-        [
-            t_bound / resc_t,
-            r_0_bound / resc_r,
-            self.rescale_param(deg_i0_a_bound, self.ind_deg_i0_a),
-            self.rescale_param(deg_ds_c_bound, self.ind_deg_ds_c),
-        ],
-        training=True,
-    )
-    output_r0_c_bound = self.model(
-        [
-            t_bound / resc_t,
-            r_0_bound / resc_r,
-            self.rescale_param(deg_i0_a_bound, self.ind_deg_i0_a),
-            self.rescale_param(deg_ds_c_bound, self.ind_deg_ds_c),
-        ],
-        training=True,
-    )
-    output_rmax_a_bound = self.model(
-        [
-            t_bound / resc_t,
-            r_max_a_bound / resc_r,
-            self.rescale_param(deg_i0_a_bound, self.ind_deg_i0_a),
-            self.rescale_param(deg_ds_c_bound, self.ind_deg_ds_c),
-        ],
-        training=True,
-    )
-    output_rmax_c_bound = self.model(
-        [
-            t_bound / resc_t,
-            r_max_c_bound / resc_r,
-            self.rescale_param(deg_i0_a_bound, self.ind_deg_i0_a),
-            self.rescale_param(deg_ds_c_bound, self.ind_deg_ds_c),
-        ],
-        training=True,
-    )
+    cs_a_prev = _eval_branch_on_grid_ASSBfinal1(self, t_prev, r_a_grid, deg_i0_a_bound, deg_ds_c_bound, self.ind_cs_a, "cs_a")
+    cs_a_next = _eval_branch_on_grid_ASSBfinal1(self, t_next, r_a_grid, deg_i0_a_bound, deg_ds_c_bound, self.ind_cs_a, "cs_a")
+    cs_c_prev = _eval_branch_on_grid_ASSBfinal1(self, t_prev, r_c_grid, deg_i0_a_bound, deg_ds_c_bound, self.ind_cs_c, "cs_c")
+    cs_c_next = _eval_branch_on_grid_ASSBfinal1(self, t_next, r_c_grid, deg_i0_a_bound, deg_ds_c_bound, self.ind_cs_c, "cs_c")
 
-    cs_r0_a_bound = self.rescaleCs_a(output_r0_a_bound[self.ind_cs_a], t_bound, r_0_bound, deg_i0_a_bound, deg_ds_c_bound, clip=False)
-    cs_r0_c_bound = self.rescaleCs_c(output_r0_c_bound[self.ind_cs_c], t_bound, r_0_bound, deg_i0_a_bound, deg_ds_c_bound, clip=False)
-    cs_rmax_a_bound = self.rescaleCs_a(output_rmax_a_bound[self.ind_cs_a], t_bound, r_max_a_bound, deg_i0_a_bound, deg_ds_c_bound, clip=False)
-    cs_rmax_c_bound = self.rescaleCs_c(output_rmax_c_bound[self.ind_cs_c], t_bound, r_max_c_bound, deg_i0_a_bound, deg_ds_c_bound, clip=False)
-
-    ds_rmax_a_bound = self.params["D_s_a"](self.params["T"], self.params["R"])
-    ds_rmax_c_bound = self.params["D_s_c"](
-        cs_rmax_c_bound,
+    grad_cs_a_next = _gradient_batch_ASSBfinal1(cs_a_next, r_a_grid)
+    grad_cs_c_next = _gradient_batch_ASSBfinal1(cs_c_next, r_c_grid)
+    ds_a_prev = self.params["D_s_a"](self.params["T"], self.params["R"]) * torch.ones_like(cs_a_prev[:, -1].reshape(-1, 1))
+    ds_c_prev_surf = self.params["D_s_c"](
+        cs_c_prev[:, -1].reshape(-1, 1),
         self.params["T"],
         self.params["R"],
         self.params["cscamax"],
         deg_ds_c_bound,
     )
 
-    j_a = _profile_flux_of_t_ASSBfinal1(self, t_bound, "a")
-    j_c = _profile_flux_of_t_ASSBfinal1(self, t_bound, "c")
-
-    cs_r0_a_bound_r = grad(cs_r0_a_bound, r_0_bound)
-    cs_r0_c_bound_r = grad(cs_r0_c_bound, r_0_bound)
-    cs_rmax_a_bound_r = grad(cs_rmax_a_bound, r_max_a_bound)
-    cs_rmax_c_bound_r = grad(cs_rmax_c_bound, r_max_c_bound)
-
-    time_gate = np.float64(1.0) - torch.exp(-t_bound / self.hard_IC_timescale)
     return [
-        [cs_r0_a_bound_r],
-        [cs_r0_c_bound_r],
-        [time_gate * (cs_rmax_a_bound_r + j_a / ds_rmax_a_bound)],
-        [time_gate * (cs_rmax_c_bound_r + j_c / ds_rmax_c_bound)],
+        [grad_cs_a_next[:, 0].reshape(-1, 1)],
+        [grad_cs_c_next[:, 0].reshape(-1, 1)],
+        [grad_cs_a_next[:, -1].reshape(-1, 1) + j_a / torch.clamp(ds_a_prev, min=1e-30)],
+        [grad_cs_c_next[:, -1].reshape(-1, 1) + j_c / torch.clamp(ds_c_prev_surf, min=1e-30)],
     ]
-
 
 
 def regularization_loss(self, reg_col_pts=None, tmax=None):
@@ -554,13 +584,11 @@ def regularization_loss(self, reg_col_pts=None, tmax=None):
     return [[_zero(self)]]
 
 
-
 def _apply_scales(terms, scales):
     scaled = []
     for term, scale in zip(terms, scales):
         scaled.append(ensure_2d(term[0]) * float(scale))
     return scaled
-
 
 
 def get_unweighted_loss(
@@ -592,15 +620,12 @@ def get_unweighted_loss(
     return torch.mean(torch.stack(losses))
 
 
-
 def get_loss_and_flat_grad(*args, **kwargs):
     raise NotImplementedError("TensorFlow-style flattened LBFGS interface was replaced by torch.optim.LBFGS in the PyTorch patch.")
 
 
-
 def get_loss_and_flat_grad_SA(*args, **kwargs):
     raise NotImplementedError("Dynamic attention is not ported in this first PyTorch patch.")
-
 
 
 def get_loss_and_flat_grad_annealing(*args, **kwargs):

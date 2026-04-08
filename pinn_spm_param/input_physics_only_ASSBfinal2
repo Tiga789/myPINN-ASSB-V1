@@ -1,0 +1,36 @@
+! ASSBfinal2: physics-only, discrete-step, teacher-consistent training
+! This version deliberately abandons random collocation.
+! Every epoch sweeps through the full known time-step sequence.
+
+ID : 9401
+REPO_ROOT : NONE
+PROFILE_PATH : C:\Users\Tiga_QJW\Desktop\ZHB_realDATA\ZHB_ASSB_NCM811_cycle5_521.csv
+PROFILE_ENCODING : auto
+PROFILE_CYCLE_START : 5
+PROFILE_CYCLE_END : 521
+
+DEVICE : auto
+DTYPE : float64
+N_R : 64
+
+EPOCHS : 200
+BATCH_SIZE_STEPS : 2048
+SHUFFLE_STEPS : False
+LEARNING_RATE : 1e-3
+LEARNING_RATE_FINAL : 1e-4
+WEIGHT_DECAY : 0.0
+GRAD_CLIP_NORM : 1.0
+
+LATENT_DIM : 12
+HIDDEN_DIM : 128
+NUM_LAYERS : 3
+R_FOURIER_MODES : 6
+
+STEP_WEIGHT_A : 1.0
+STEP_WEIGHT_C : 1.0
+BOUND_WEIGHT_A : 0.1
+BOUND_WEIGHT_C : 0.1
+
+LOG_EVERY : 1
+SAVE_EVERY : 10
+TIME_CHUNK_EVAL : 2048
